@@ -14,9 +14,11 @@ def mix_audio(payload: dict):
     with open("/tmp/music.mp3", "wb") as f:
         f.write(requests.get(payload.get("music_url")).content)
         
-    # 2. Run the system-level FFmpeg command
+   # 2. Run the system-level FFmpeg command
     cmd = [
-        "ffmpeg", "-i", "/tmp/voice.mp3", "-stream_loop", "-1", "-i", "/tmp/music.mp3",
+        "ffmpeg", 
+        "-i", "/tmp/voice.mp3", 
+        "-stream_loop", "-1", "-i", "/tmp/music.mp3", # Loops the music indefinitely
         "-filter_complex", "[1:a]volume=0.1[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]",
         "-map", "[aout]", "-y", "/tmp/mixed.mp3"
     ]
