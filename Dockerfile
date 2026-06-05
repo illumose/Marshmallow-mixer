@@ -1,7 +1,11 @@
 FROM python:3.11-slim
 
-# Install the FFmpeg OS package
-RUN apt-get update && apt-get install -y ffmpeg
+# Install system-level build dependencies and FFmpeg
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set up the Python environment
 WORKDIR /app
