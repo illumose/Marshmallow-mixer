@@ -25,7 +25,7 @@ def mix_audio(payload: dict):
         # 2. Set background music to 20% volume
         "[1:a]aresample=44100,volume=0.20[bg];"
         # 3. Mix them together (duration=first ensures it cuts off when the voice ends)
-        "[voice][bg]amix=inputs=2:duration=first:dropout_transition=2,aresample=44100[aout]",
+        "[voice][bg]amix=inputs=2:duration=first:dropout_transition=0,aresample=44100[aout]",
         "-map", "[aout]", "-y", "/tmp/mixed.mp3"
     ]
     subprocess.run(cmd, check=True)
