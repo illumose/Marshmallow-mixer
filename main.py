@@ -29,7 +29,7 @@ def mix_audio(payload: dict):
         "-i", voice_path, 
         "-stream_loop", "-1", "-i", music_path, 
         "-filter_complex", 
-        "[0:a]aresample=44100,adelay=7000|7000[voice];[1:a]aresample=44100,volume=0.20[bg];[voice][bg]amix=inputs=2:duration=first:dropout_transition=0,aresample=44100[aout]",
+        "[0:a]aresample=44100,adelay=7000|7000[voice];[1:a]aresample=44100,volume=0.10[bg];[voice][bg]amix=inputs=2:duration=first:dropout_transition=0,aresample=44100[aout]",
         "-map", "[aout]", "-y", out_path
     ]
     subprocess.run(cmd, check=True)
