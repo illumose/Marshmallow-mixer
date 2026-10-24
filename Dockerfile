@@ -1,19 +1,15 @@
 FROM python:3.11-slim
 
-# Install system-level build dependencies and FFmpeg
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 mixer \
+    && useradd --uid 10001 --gid 10001 --no-create-home mixer
 
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
-
-# Upgrade pip and install dependencies in separate steps to debug easier
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 COPY main.py .
-
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}"]
+COPY tests ./tests
+USER 10001:10001
+CMD ["sh", "-c", "exec uvicorn main:app --host 0.0.0.0 --port \"${PORT:-10000}\" --no-access-log --limit-concurrency 8"]

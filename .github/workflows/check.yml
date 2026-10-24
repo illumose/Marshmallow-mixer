@@ -1,0 +1,16 @@
+name: Private mixer checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  synthetic-mixer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the actual Python 3.11 runtime
+        run: docker build --pull -t marshmallow-private-mixer:test .
+      - name: Run synthetic checks inside the non-root image
+        run: docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --entrypoint python marshmallow-private-mixer:test -m unittest discover -s tests -v
