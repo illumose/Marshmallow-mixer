@@ -13,4 +13,4 @@ jobs:
       - name: Build the actual Python 3.11 runtime
         run: docker build --pull -t marshmallow-private-mixer:test .
       - name: Run synthetic checks inside the non-root image
-        run: docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --entrypoint python marshmallow-private-mixer:test -m unittest discover -s tests -v
+        run: docker run --rm --cpus=1 --memory=500000000 --memory-swap=500000000 --pids-limit=128 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --entrypoint python marshmallow-private-mixer:test -m unittest discover -s tests -v
