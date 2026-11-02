@@ -27,6 +27,15 @@ from starlette.concurrency import run_in_threadpool
 MAX_BYTES = 32 * 1024 * 1024
 MAX_BODY = 20_000
 JOB_SECONDS = 90
+MAX_ACTIVE_MIXES = 1
+SAMPLE_RATE = 44_100
+MAX_LOOP_BUFFER_SECONDS = 120.0
+MIN_MUSIC_SECONDS = 1.0
+MUSIC_GAIN = 0.10
+DUCK_THRESHOLD = 0.0631  # -24 dBFS as a linear amplitude value
+LOUDNESS_TARGET_I = -16.0
+LOUDNESS_TARGET_TP = -2.0
+ENCODED_TRUE_PEAK_LIMIT = -1.0
 DNS_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mixer-dns")
 HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\Z")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
@@ -189,23 +198,129 @@ def duration(path: Path, deadline: float) -> float:
     return value
 
 
+def loop_parameters(music_duration: float, output_duration: float) -> tuple[float, float, int] | None:
+    """Return a bounded loop prefix, or None when music already covers the mix."""
+    if not math.isfinite(music_duration) or music_duration < MIN_MUSIC_SECONDS or music_duration > 600:
+        raise MediaFailure()
+    if music_duration >= output_duration:
+        return None
+    loop_duration = min(music_duration, MAX_LOOP_BUFFER_SECONDS)
+    crossfade = min(1.0, loop_duration / 4.0)
+    loop_samples = round((loop_duration - crossfade) * SAMPLE_RATE)
+    if crossfade <= 0 or loop_samples <= 0:
+        raise MediaFailure()
+    return loop_duration, crossfade, loop_samples
+
+
+def loudnorm_metrics(stderr: bytes) -> dict[str, float]:
+    """Parse one content-free FFmpeg loudnorm metrics object from its private stderr."""
+    try:
+        start = stderr.rfind(b"{")
+        end = stderr.find(b"}", start)
+        if start < 0 or end < 0:
+            raise ValueError
+        metrics = json.loads(stderr[start:end + 1])
+        parsed = {key: float(metrics[key]) for key in (
+            "input_i", "input_tp", "input_lra", "input_thresh", "target_offset", "output_tp"
+        )}
+    except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+        raise MediaFailure() from None
+    if not all(math.isfinite(value) for value in parsed.values()):
+        raise MediaFailure()
+    return parsed
+
+
+def measured_filter_true_peak(stderr: bytes) -> float:
+    """Read the loudnorm true peak before MP3 encoding."""
+    value = loudnorm_metrics(stderr)["output_tp"]
+    if value > LOUDNESS_TARGET_TP + 0.5:
+        raise MediaFailure()
+    return value
+
+
+def measured_encoded_true_peak(path: Path, deadline: float) -> float:
+    """Measure the decoded MP3's true peak and reject unsafe encoder overshoot."""
+    args = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-v", "info", "-nostats",
+        "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3", "-i", str(path),
+        "-af", f"loudnorm=I={LOUDNESS_TARGET_I}:TP={LOUDNESS_TARGET_TP}:LRA=11:linear=false:print_format=json",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True,
+                            timeout=min(20, remaining(deadline)))
+    value = loudnorm_metrics(result.stderr)["input_tp"]
+    if value > ENCODED_TRUE_PEAK_LIMIT:
+        raise MediaFailure()
+    return value
+
+
 def render(payload: dict, settings: Settings, directory: Path) -> Path:
     deadline = time.monotonic() + JOB_SECONDS
     voice, music, output = (directory / name for name in ("voice.audio", "music.audio", "mixed.mp3"))
     download(payload["voice_url"], voice, settings, True, deadline)
     download(payload["music_url"], music, settings, False, deadline)
     voice_duration = duration(voice, deadline)
-    duration(music, deadline)
+    music_duration = duration(music, deadline)
     total = 7.0 + voice_duration + 4.0
-    filters = ("[0:a]aresample=44100,adelay=7000|7000,apad=pad_dur=4.0[voice];"
-               f"[1:a]aresample=44100,volume=0.10,afade=t=out:st={total - 3.0}:d=3.0[bg];"
-               "[voice][bg]amix=inputs=2:duration=first:dropout_transition=0,aresample=44100[aout]")
-    args = ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(voice),
-            "-stream_loop", "-1", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(music),
-            "-filter_complex", filters, "-map", "[aout]", "-map_metadata", "-1", "-fs", str(MAX_BYTES), "-y", str(output)]
-    subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=min(60, remaining(deadline)))
-    if not output.is_file() or not 0 < output.stat().st_size < MAX_BYTES or abs(duration(output, deadline) - total) > 0.5:
+    loop = loop_parameters(music_duration, total)
+    stereo = f"aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:sample_rates={SAMPLE_RATE}:channel_layouts=stereo"
+    if loop is None:
+        music_graph = f"[1:a]{stereo},atrim=duration={total:.6f},asetpts=PTS-STARTPTS[bedraw]"
+    else:
+        loop_duration, crossfade, loop_samples = loop
+        music_graph = (
+            f"[1:a]{stereo},asplit=3[head_src][middle_src][tail_src];"
+            f"[head_src]atrim=start=0:end={crossfade:.6f},asetpts=PTS-STARTPTS[head];"
+            f"[middle_src]atrim=start={crossfade:.6f}:end={loop_duration - crossfade:.6f},asetpts=PTS-STARTPTS[middle];"
+            f"[tail_src]atrim=start={loop_duration - crossfade:.6f}:end={loop_duration:.6f},asetpts=PTS-STARTPTS[tail];"
+            f"[tail][head]acrossfade=d={crossfade:.6f}:c1=qsin:c2=qsin[seam];"
+            f"[seam][middle]concat=n=2:v=0:a=1,aloop=loop=-1:size={loop_samples},"
+            f"atrim=duration={total:.6f},asetpts=PTS-STARTPTS[bedraw]"
+        )
+    fade_start = total - 3.0
+    mix_filters = (
+        f"[0:a]{stereo},adelay=7000|7000,apad=pad_dur=4.0[voice];"
+        f"{music_graph};"
+        f"[bedraw]volume={MUSIC_GAIN:.4f},afade=t=out:st={fade_start:.6f}:d=3.0[bed];"
+        "[voice]asplit=2[voice_mix][voice_key];"
+        f"[bed][voice_key]sidechaincompress=threshold={DUCK_THRESHOLD}:ratio=2:attack=20:release=500[ducked];"
+        "[voice_mix][ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[rawmix]"
+    )
+    # Measure once, then apply one linear normalization pass so the speech bed
+    # does not get a second dynamic gain ride after sidechain compression.
+    input_args = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-v", "info", "-nostats", "-filter_complex_threads", "1",
+        "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(voice),
+        "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(music),
+    ]
+    analysis_filters = (
+        f"{mix_filters};[rawmix]loudnorm=I={LOUDNESS_TARGET_I}:TP={LOUDNESS_TARGET_TP}:"
+        "LRA=11:linear=false:print_format=json[measure]"
+    )
+    analysis_args = input_args + ["-filter_complex", analysis_filters, "-map", "[measure]", "-f", "null", "-"]
+    analysis = subprocess.run(analysis_args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True,
+                              timeout=min(25, remaining(deadline)))
+    measured = loudnorm_metrics(analysis.stderr)
+    linear_loudnorm = (
+        f"loudnorm=I={LOUDNESS_TARGET_I}:TP={LOUDNESS_TARGET_TP}:LRA=11:"
+        f"measured_I={measured['input_i']:.6f}:measured_TP={measured['input_tp']:.6f}:"
+        f"measured_LRA={measured['input_lra']:.6f}:measured_thresh={measured['input_thresh']:.6f}:"
+        f"offset={measured['target_offset']:.6f}:linear=true:print_format=json"
+    )
+    filters = f"{mix_filters};[rawmix]{linear_loudnorm},aresample={SAMPLE_RATE}[aout]"
+    args = input_args + [
+        "-filter_complex", filters, "-map", "[aout]", "-map_metadata", "-1", "-threads:a", "1",
+        "-c:a", "libmp3lame", "-b:a", "192k", "-ar", str(SAMPLE_RATE), "-ac", "2", "-f", "mp3",
+        "-fs", str(MAX_BYTES), "-y", str(output),
+    ]
+    result = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True,
+                            timeout=min(50, remaining(deadline)))
+    measured_filter_true_peak(result.stderr)
+    if not output.is_file() or not 0 < output.stat().st_size < MAX_BYTES:
         raise MediaFailure()
+    if abs(duration(output, deadline) - total) > 0.5:
+        raise MediaFailure()
+    measured_encoded_true_peak(output, deadline)
     return output
 
 
@@ -227,7 +342,7 @@ class PrivateAudioResponse(FileResponse):
 
 def create_app(settings: Settings | None = None):
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-    slots = threading.BoundedSemaphore(2)
+    slots = threading.BoundedSemaphore(MAX_ACTIVE_MIXES)
     active_work = set()
 
     def exact_object(pairs):

@@ -1,10 +1,13 @@
 import asyncio
 import io
 import json
+import math
 from pathlib import Path
+import re
 import socket
 import ssl
 import subprocess
+import struct
 import tempfile
 import threading
 import time
@@ -168,6 +171,73 @@ class URLAndDownloadTests(unittest.TestCase):
             self.download([FakeResponse(status=302, headers={"Location": MUSIC}) for _ in range(4)])
 
 
+class AudioPlanTests(unittest.TestCase):
+    def test_loop_buffer_is_bounded_for_long_catalog_tracks(self):
+        plan = m.loop_parameters(600.0, 611.0)
+        self.assertEqual(plan, (120.0, 1.0, 5_247_900))
+        self.assertLess(plan[2] * 2 * 4, 43_000_000)  # stereo float samples, bytes
+        self.assertIsNone(m.loop_parameters(120.0, 100.0))
+
+    def test_music_must_be_long_enough_to_make_a_smooth_loop(self):
+        for value in [0.0, 0.25, 0.999, float("nan"), float("inf"), 601.0]:
+            with self.subTest(value=value), self.assertRaises(m.MediaFailure):
+                m.loop_parameters(value, 20.0)
+
+    def test_filter_true_peak_is_parsed_and_guarded_before_encoding(self):
+        valid = b'{"input_i":"-18.0","input_tp":"-3.0","input_lra":"2.0","input_thresh":"-28.0","target_offset":"0.0","output_tp":"-2.0"}'
+        self.assertEqual(m.measured_filter_true_peak(valid), -2.0)
+        hot = valid.replace(b'"output_tp":"-2.0"', b'"output_tp":"-1.0"')
+        missing = valid.replace(b'"input_tp":"-3.0",', b'')
+        malformed = valid.replace(b'"output_tp":"-2.0"', b'"output_tp":"nan"')
+        for log in [b"no metrics", missing, hot, malformed]:
+            with self.subTest(log=log), self.assertRaises(m.MediaFailure):
+                m.measured_filter_true_peak(log)
+
+    def test_encoded_mp3_true_peak_guard_rejects_hot_audio(self):
+        rate = 44100
+        frequency = 997.0
+        samples = [round(32767 * math.sin(2 * math.pi * frequency * i / rate)) for i in range(rate * 2)]
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "hot.wav"
+            encoded = Path(tmp) / "hot.mp3"
+            with wave.open(str(source), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(rate)
+                wav.writeframes(struct.pack("<" + "h" * len(samples), *samples))
+            subprocess.run(
+                ["ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-i", str(source), "-af", "volume=3dB",
+                 "-c:a", "libmp3lame", "-b:a", "192k", "-ar", str(rate), "-ac", "2", "-y", str(encoded)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=10,
+            )
+            with self.assertRaises(m.MediaFailure):
+                m.measured_encoded_true_peak(encoded, time.monotonic() + 15)
+
+    def test_120_second_synthetic_voice_mix_stays_inside_job_budget(self):
+        def local_download(value, path, settings, voice, deadline):
+            rate = 16000
+            if voice:
+                samples = [round(5000 * math.sin(2 * math.pi * 880.0 * i / rate)) for i in range(rate)]
+                frames = struct.pack("<" + "h" * len(samples), *samples) * 120
+            else:
+                seconds = 2.37
+                samples = [round(12000 * math.sin(2 * math.pi * 440.0 * i / rate)) for i in range(round(seconds * rate))]
+                frames = struct.pack("<" + "h" * len(samples), *samples)
+            with wave.open(str(path), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(rate)
+                wav.writeframes(frames)
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(m, "download", side_effect=local_download):
+            started = time.monotonic()
+            output = m.render(PAYLOAD, CONFIG, Path(tmp))
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, m.JOB_SECONDS)
+            self.assertLess(output.stat().st_size, m.MAX_BYTES)
+            self.assertAlmostEqual(m.duration(output, time.monotonic() + 5), 131.0, delta=0.5)
+
+
 class APITests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.app = m.create_app(CONFIG)
@@ -248,24 +318,20 @@ class APITests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrency_slots_held_until_response_finishes(self):
         gate = asyncio.Event()
         started = asyncio.Event()
-        count = 0
 
         async def block_send(message):
-            nonlocal count
             if message["type"] == "http.response.start":
-                count += 1
-                if count == 2:
-                    started.set()
+                started.set()
                 await gate.wait()
 
         with patch.object(m, "render", side_effect=self.render):
-            tasks = [asyncio.create_task(request(self.app, send_hook=block_send)) for _ in range(2)]
+            task = asyncio.create_task(request(self.app, send_hook=block_send))
             try:
                 await asyncio.wait_for(started.wait(), 3)
                 self.assertEqual((await request(self.app))[0], 429)
             finally:
                 gate.set()
-                await asyncio.gather(*tasks)
+                await task
             self.assertEqual((await request(self.app))[0], 200)
         self.assertTrue(all(not p.exists() for p in self.directories))
 
@@ -295,14 +361,26 @@ class APITests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
             self.assertFalse(self.directories[0].exists())
 
-    async def test_real_ffmpeg_synthetic_mix_streams_mp3_with_preserved_timing_and_cleanup(self):
+    async def test_real_ffmpeg_synthetic_mix_ducks_speech_normalizes_and_measures_peak(self):
         def local_download(value, path, settings, voice, deadline):
             self.directories.append(path.parent)
+            source_duration = 4.0 if voice else 2.37
+            rate = 16000
+            samples = []
+            for index in range(round(source_duration * rate)):
+                t = index / rate
+                if voice:
+                    amplitude = 0.60 if 0.4 <= t < 2.4 else 0.0
+                    frequency = 880.0
+                else:
+                    amplitude = 0.60
+                    frequency = 440.0
+                samples.append(round(32767 * amplitude * math.sin(2 * math.pi * frequency * t)))
             with wave.open(str(path), "wb") as wav:
                 wav.setnchannels(1)
                 wav.setsampwidth(2)
-                wav.setframerate(16000)
-                wav.writeframes(b"\0\0" * (1600 if voice else 3200))
+                wav.setframerate(rate)
+                wav.writeframes(struct.pack("<" + "h" * len(samples), *samples))
 
         with patch.object(m, "download", side_effect=local_download):
             status, headers, body, _ = await request(self.app)
@@ -313,7 +391,73 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "result.mp3"
             path.write_bytes(body)
-            self.assertAlmostEqual(m.duration(path, time.monotonic() + 5), 11.1, delta=0.5)
+            self.assertAlmostEqual(m.duration(path, time.monotonic() + 5), 15.0, delta=0.5)
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3",
+                 "-select_streams", "a:0", "-show_entries", "stream=codec_name,sample_rate,channels,bit_rate",
+                 "-of", "json", str(path)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=5,
+            )
+            stream = json.loads(probe.stdout)["streams"][0]
+            self.assertEqual(stream["codec_name"], "mp3")
+            self.assertEqual(stream["sample_rate"], "44100")
+            self.assertEqual(stream["channels"], 2)
+            self.assertEqual(stream["bit_rate"], "192000")
+
+            measured = subprocess.run(
+                ["ffmpeg", "-nostdin", "-hide_banner", "-v", "info", "-protocol_whitelist", "file,pipe",
+                 "-format_whitelist", "mp3", "-i", str(path), "-filter_complex", "ebur128=peak=true",
+                 "-f", "null", "-"], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True, timeout=10,
+            )
+            true_peaks = re.findall(rb"True peak:\s*\n\s*Peak:\s*([-+0-9.]+)\s*dBFS", measured.stderr)
+            self.assertTrue(true_peaks, measured.stderr.decode("utf-8", errors="replace"))
+            self.assertLessEqual(float(true_peaks[-1]), -1.0)
+            integrated = re.findall(rb"(?m)^\s*I:\s*([-+0-9.]+)\s*LUFS$", measured.stderr)
+            self.assertTrue(integrated, measured.stderr.decode("utf-8", errors="replace"))
+            self.assertLessEqual(abs(float(integrated[-1]) - (-16.0)), 1.5)
+
+            decoded = subprocess.run(
+                ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3",
+                 "-i", str(path), "-map", "0:a:0", "-ac", "1", "-ar", "8000", "-f", "f32le", "pipe:1"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=10,
+            )
+            samples = struct.unpack("<" + "f" * (len(decoded.stdout) // 4), decoded.stdout)
+
+            loop_samples = m.loop_parameters(2.37, 15.0)[2]
+            loop_period = loop_samples / m.SAMPLE_RATE
+
+            def seam_jump_ratio(boundary_seconds):
+                center = round(boundary_seconds * 8000)
+                local = [abs(samples[index] - samples[index - 1])
+                         for index in range(center - 120, center + 121)
+                         if abs(index - center) > 10]
+                seam = [abs(samples[index] - samples[index - 1])
+                        for index in range(center - 2, center + 3)]
+                return max(seam), max(local)
+
+            for boundary in [2.37, *(loop_period * repeat for repeat in range(1, 5))]:
+                with self.subTest(loop_boundary=boundary):
+                    seam, local_peak = seam_jump_ratio(boundary)
+                    self.assertLessEqual(seam, local_peak * 2.0 + 0.025)
+
+            def music_tone_amplitude(start_seconds):
+                sample_rate = 8000
+                first = round(start_seconds * sample_rate)
+                count = round(0.5 * sample_rate)
+                sine = cosine = 0.0
+                for offset, sample in enumerate(samples[first:first + count]):
+                    phase = 2 * math.pi * 440.0 * offset / sample_rate
+                    sine += sample * math.sin(phase)
+                    cosine += sample * math.cos(phase)
+                return 2 * math.hypot(sine, cosine) / count
+
+            intro_level = music_tone_amplitude(6.0)
+            speech_level = music_tone_amplitude(7.8)
+            recovery_level = music_tone_amplitude(11.3)
+            self.assertGreater(intro_level, 0.001)
+            duck_db = 20 * math.log10(speech_level / intro_level)
+            self.assertGreaterEqual(duck_db, -14.0)
+            self.assertLessEqual(duck_db, -4.0)
+            self.assertGreaterEqual(20 * math.log10(recovery_level / speech_level), 3.0)
 
 
 if __name__ == "__main__":
