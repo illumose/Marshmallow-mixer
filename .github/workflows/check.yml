@@ -8,9 +8,12 @@ permissions:
 jobs:
   synthetic-mixer:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Build the actual Python 3.11 runtime
         run: docker build --pull -t marshmallow-private-mixer:test .
-      - name: Run synthetic checks inside the non-root image
-        run: docker run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --entrypoint python marshmallow-private-mixer:test -m unittest discover -s tests -v
+      - name: Run synthetic checks inside the non-root image at staging limits
+        run: docker run --rm --cpus=0.25 --memory=500000000 --memory-swap=500000000 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --entrypoint python marshmallow-private-mixer:test -m unittest discover -s tests -v
+      - name: Check two synthetic preview-length renders at staging limits
+        run: docker run --rm --cpus=0.25 --memory=500000000 --memory-swap=500000000 --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m --entrypoint python marshmallow-private-mixer:test tests/resource_probe.py --worker two_near_copy_cap
