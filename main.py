@@ -189,19 +189,88 @@ def duration(path: Path, deadline: float) -> float:
     return value
 
 
+def music_edges(path: Path, deadline: float) -> tuple[float, float, float]:
+    """Return active [start, end) and source duration, rejecting silent gaps."""
+    source_duration = duration(path, deadline)
+    args = ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-v", "info",
+            "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov",
+            "-i", str(path), "-af", "silencedetect=n=-50dB:d=0.1", "-f", "null", "-"]
+    try:
+        result = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                check=True, timeout=min(10, remaining(deadline)))
+    except (OSError, subprocess.SubprocessError):
+        raise MediaFailure() from None
+    # stderr is parsed only for numeric silence boundaries and is never logged or returned.
+    events = []
+    for match in re.finditer(r"silence_(start|end):\s*([0-9]+(?:\.[0-9]+)?)", result.stderr.decode("ascii", "ignore")):
+        events.append((match.group(1), float(match.group(2))))
+    intervals = []
+    active_start = None
+    for kind, timestamp in events:
+        if kind == "start":
+            active_start = timestamp
+        elif active_start is not None:
+            if timestamp - active_start >= 0.1 - 1e-6:
+                intervals.append((active_start, timestamp))
+            active_start = None
+    if active_start is not None:
+        intervals.append((active_start, source_duration))
+    # Silence detection may report a boundary as a few samples from zero/end.
+    leading_index = next((i for i, (start, _) in enumerate(intervals) if start <= 0.01), None)
+    trailing_index = next((i for i in range(len(intervals) - 1, -1, -1)
+                           if intervals[i][1] >= source_duration - 0.05), None)
+    leading = intervals[leading_index][1] if leading_index is not None else 0.0
+    trailing = intervals[trailing_index][0] if trailing_index is not None else source_duration
+    if leading >= trailing or trailing - leading < 0.1:
+        raise MediaFailure()
+    if any(i not in {leading_index, trailing_index} for i in range(len(intervals))):
+        raise MediaFailure()
+    return leading, trailing, source_duration
+
+
+def music_copies(start: float, end: float, total: float) -> int:
+    active = end - start
+    if not all(math.isfinite(x) for x in (start, end, total)) or start < 0 or active <= 0 or total <= 0:
+        raise MediaFailure()
+    overlap = min(3.0, active / 2.0)
+    copies = 1 if active >= total else math.ceil((total - active) / (active - overlap)) + 1
+    # Bound decoder/graph memory for two jobs on the 500 MB staging replica.
+    if copies > 8:
+        raise MediaFailure()
+    return copies
+
+
+def music_filter(start: float, end: float, total: float) -> str:
+    """Build finite crossfades from separately opened copies of the local source."""
+    copies = music_copies(start, end, total)
+    overlap = min(3.0, (end - start) / 2.0)
+    parts = [f"[{i + 1}:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS,aresample=44100[m{i}]"
+             for i in range(copies)]
+    previous = "m0"
+    for i in range(1, copies):
+        output = f"mx{i}"
+        parts.append(f"[{previous}][m{i}]acrossfade=d={overlap:.6f}:c1=qsin:c2=qsin[{output}]")
+        previous = output
+    parts.append(f"[{previous}]atrim=duration={total:.6f},asetpts=PTS-STARTPTS[music]")
+    return ";".join(parts)
+
+
 def render(payload: dict, settings: Settings, directory: Path) -> Path:
     deadline = time.monotonic() + JOB_SECONDS
     voice, music, output = (directory / name for name in ("voice.audio", "music.audio", "mixed.mp3"))
     download(payload["voice_url"], voice, settings, True, deadline)
     download(payload["music_url"], music, settings, False, deadline)
     voice_duration = duration(voice, deadline)
-    duration(music, deadline)
+    music_start, music_end, _ = music_edges(music, deadline)
     total = 7.0 + voice_duration + 4.0
+    music_graph = music_filter(music_start, music_end, total)
     filters = ("[0:a]aresample=44100,adelay=7000|7000,apad=pad_dur=4.0[voice];"
-               f"[1:a]aresample=44100,volume=0.10,afade=t=out:st={total - 3.0}:d=3.0[bg];"
+               f"{music_graph};[music]volume=0.10,afade=t=out:st={total - 3.0}:d=3.0[bg];"
                "[voice][bg]amix=inputs=2:duration=first:dropout_transition=0,aresample=44100[aout]")
-    args = ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(voice),
-            "-stream_loop", "-1", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(music),
+    args = ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(voice)]
+    for _ in range(music_copies(music_start, music_end, total)):
+        args.extend(["-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(music)])
+    args += [
             "-filter_complex", filters, "-map", "[aout]", "-map_metadata", "-1", "-fs", str(MAX_BYTES), "-y", str(output)]
     subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=min(60, remaining(deadline)))
     if not output.is_file() or not 0 < output.stat().st_size < MAX_BYTES or abs(duration(output, deadline) - total) > 0.5:
@@ -334,3 +403,4 @@ def create_app(settings: Settings | None = None):
 
 
 app = create_app()
+

@@ -1,9 +1,11 @@
 import asyncio
 import io
 import json
+import math
 from pathlib import Path
 import socket
 import ssl
+import struct
 import subprocess
 import tempfile
 import threading
@@ -295,6 +297,24 @@ class APITests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
             self.assertFalse(self.directories[0].exists())
 
+    async def test_music_exceeding_copy_limit_fails_closed_and_cleans(self):
+        def local_download(value, path, settings, voice, deadline):
+            self.directories.append(path.parent)
+            with wave.open(str(path), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                if voice:
+                    wav.writeframes(b"\0\0" * 1600)
+                else:
+                    wav.writeframes(b"".join(struct.pack("<h", int(9000 * math.sin(2 * math.pi * 440 * i / 16000))) for i in range(6400)))
+        with patch.object(m, "download", side_effect=local_download):
+            status, _, body, _ = await request(self.app)
+        self.assertEqual(status, 502)
+        self.assertEqual(json.loads(body), {"detail": "MIXER_MEDIA_UNAVAILABLE"})
+        self.assertTrue(self.directories)
+        self.assertTrue(all(not path.exists() for path in self.directories))
+
     async def test_real_ffmpeg_synthetic_mix_streams_mp3_with_preserved_timing_and_cleanup(self):
         def local_download(value, path, settings, voice, deadline):
             self.directories.append(path.parent)
@@ -302,7 +322,14 @@ class APITests(unittest.IsolatedAsyncioTestCase):
                 wav.setnchannels(1)
                 wav.setsampwidth(2)
                 wav.setframerate(16000)
-                wav.writeframes(b"\0\0" * (1600 if voice else 3200))
+                if voice:
+                    wav.writeframes(b"\0\0" * 1600)
+                else:
+                    frames = bytearray()
+                    for i in range(64000):
+                        sample = int(9000 * math.sin(2 * math.pi * 440 * i / 16000))
+                        frames.extend(struct.pack("<h", sample))
+                    wav.writeframes(frames)
 
         with patch.object(m, "download", side_effect=local_download):
             status, headers, body, _ = await request(self.app)
@@ -318,3 +345,4 @@ class APITests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
