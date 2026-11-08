@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import http.client
 import ipaddress
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ from starlette.concurrency import run_in_threadpool
 MAX_BYTES = 32 * 1024 * 1024
 MAX_BODY = 20_000
 JOB_SECONDS = 90
+LOGGER = logging.getLogger(__name__)
 DNS_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="mixer-dns")
 HOST = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\Z")
 UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
@@ -35,6 +37,15 @@ VOICE_PATH = re.compile(r"/storage/v1/object/sign/marshmallow-private/" + UUID +
 
 class MediaFailure(Exception):
     """Fixed, content-free failure; underlying exceptions are never returned."""
+
+    STAGES = (
+        "voice_download", "music_download", "voice_probe", "music_analysis",
+        "music_interior_silence", "music_graph", "ffmpeg_render", "output_validation",
+    )
+
+    def __init__(self, stage=None):
+        super().__init__()
+        self.stage = stage if stage in self.STAGES else None
 
 
 def host_ok(host: str) -> bool:
@@ -224,7 +235,7 @@ def music_edges(path: Path, deadline: float) -> tuple[float, float, float]:
     if leading >= trailing or trailing - leading < 0.1:
         raise MediaFailure()
     if any(i not in {leading_index, trailing_index} for i in range(len(intervals))):
-        raise MediaFailure()
+        raise MediaFailure("music_interior_silence")
     return leading, trailing, source_duration
 
 
@@ -258,23 +269,35 @@ def music_filter(start: float, end: float, total: float) -> str:
 def render(payload: dict, settings: Settings, directory: Path) -> Path:
     deadline = time.monotonic() + JOB_SECONDS
     voice, music, output = (directory / name for name in ("voice.audio", "music.audio", "mixed.mp3"))
-    download(payload["voice_url"], voice, settings, True, deadline)
-    download(payload["music_url"], music, settings, False, deadline)
-    voice_duration = duration(voice, deadline)
-    music_start, music_end, _ = music_edges(music, deadline)
-    total = 7.0 + voice_duration + 4.0
-    music_graph = music_filter(music_start, music_end, total)
-    filters = ("[0:a]aresample=44100,adelay=7000|7000,apad=pad_dur=4.0[voice];"
-               f"{music_graph};[music]volume=0.10,afade=t=out:st={total - 3.0}:d=3.0[bg];"
-               "[voice][bg]amix=inputs=2:duration=first:dropout_transition=0,aresample=44100[aout]")
-    args = ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(voice)]
-    for _ in range(music_copies(music_start, music_end, total)):
-        args.extend(["-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(music)])
-    args += [
+    stage = "voice_download"
+    try:
+        download(payload["voice_url"], voice, settings, True, deadline)
+        stage = "music_download"
+        download(payload["music_url"], music, settings, False, deadline)
+        stage = "voice_probe"
+        voice_duration = duration(voice, deadline)
+        stage = "music_analysis"
+        music_start, music_end, _ = music_edges(music, deadline)
+        stage = "music_graph"
+        total = 7.0 + voice_duration + 4.0
+        music_graph = music_filter(music_start, music_end, total)
+        filters = ("[0:a]aresample=44100,adelay=7000|7000,apad=pad_dur=4.0[voice];"
+                   f"{music_graph};[music]volume=0.10,afade=t=out:st={total - 3.0}:d=3.0[bg];"
+                   "[voice][bg]amix=inputs=2:duration=first:dropout_transition=0,aresample=44100[aout]")
+        args = ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(voice)]
+        for _ in range(music_copies(music_start, music_end, total)):
+            args.extend(["-protocol_whitelist", "file,pipe", "-format_whitelist", "mp3,wav,mov", "-i", str(music)])
+        args += [
             "-filter_complex", filters, "-map", "[aout]", "-map_metadata", "-1", "-fs", str(MAX_BYTES), "-y", str(output)]
-    subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=min(60, remaining(deadline)))
-    if not output.is_file() or not 0 < output.stat().st_size < MAX_BYTES or abs(duration(output, deadline) - total) > 0.5:
-        raise MediaFailure()
+        stage = "ffmpeg_render"
+        subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=min(60, remaining(deadline)))
+        stage = "output_validation"
+        if not output.is_file() or not 0 < output.stat().st_size < MAX_BYTES or abs(duration(output, deadline) - total) > 0.5:
+            raise MediaFailure()
+    except Exception as error:
+        if isinstance(error, MediaFailure) and error.stage:
+            raise
+        raise MediaFailure(stage) from None
     return output
 
 
@@ -392,11 +415,14 @@ def create_app(settings: Settings | None = None):
                 cleanup()
             if not isinstance(error, Exception):
                 raise
+            stage = error.stage if isinstance(error, MediaFailure) else None
+            LOGGER.warning("mixer_media_failure stage=%s", stage or "render_unclassified")
             raise HTTPException(502, "MIXER_MEDIA_UNAVAILABLE") from None
         try:
             return PrivateAudioResponse(path, cleanup)
         except Exception:
             cleanup()
+            LOGGER.warning("mixer_media_failure stage=response_setup")
             raise HTTPException(502, "MIXER_MEDIA_UNAVAILABLE") from None
 
     return app
