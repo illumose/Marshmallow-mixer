@@ -228,14 +228,29 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         def fail(payload, settings, directory):
             self.render(payload, settings, directory)
             raise RuntimeError(VOICE + " SYNTHETIC_PRIVATE_CONTENT")
-        with patch.object(m, "render", side_effect=fail):
+        with patch.object(m, "render", side_effect=fail), self.assertLogs(m.LOGGER) as captured:
             for _ in range(3):
                 status, _, body, _ = await request(self.app)
                 self.assertEqual(status, 502)
                 self.assertEqual(json.loads(body), {"detail": "MIXER_MEDIA_UNAVAILABLE"})
+        self.assertEqual([record.getMessage() for record in captured.records],
+                         ["mixer_media_failure stage=render_unclassified"] * 3)
         self.assertTrue(all(not p.exists() for p in self.directories))
         with patch.object(m, "render", side_effect=self.render):
             self.assertEqual((await request(self.app))[0], 200)
+
+    async def test_music_download_failure_logs_only_the_fixed_stage(self):
+        def download(value, path, settings, voice, deadline):
+            if voice:
+                return
+            raise RuntimeError(value + " SYNTHETIC_PRIVATE_CONTENT")
+
+        with patch.object(m, "download", side_effect=download), self.assertLogs(m.LOGGER) as captured:
+            status, _, body, _ = await request(self.app)
+        self.assertEqual(status, 502)
+        self.assertEqual(json.loads(body), {"detail": "MIXER_MEDIA_UNAVAILABLE"})
+        self.assertEqual([record.getMessage() for record in captured.records],
+                         ["mixer_media_failure stage=music_download"])
 
     async def test_response_disconnect_cleans_files_and_releases_capacity(self):
         async def fail_send(message):
