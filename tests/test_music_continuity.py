@@ -108,8 +108,11 @@ class MusicContinuityTests(unittest.TestCase):
         write_tone(silent, lead=1.0, tone=0.0)
         write_tone(gap, tone=0.4, gap=0.25)
         for path in (silent, gap):
-            with self.subTest(path=path.name), self.assertRaises(MediaFailure):
-                music_edges(path, time.monotonic() + 15)
+            with self.subTest(path=path.name):
+                with self.assertRaises(MediaFailure) as failure:
+                    music_edges(path, time.monotonic() + 15)
+                expected_stage = "music_interior_silence" if path == gap else None
+                self.assertEqual(failure.exception.stage, expected_stage)
 
     def test_repeat_count_is_bounded_and_single_long_clip_needs_no_crossfade(self):
         self.assertIn("acrossfade", music_filter(0.0, 2.0, 5.0))
