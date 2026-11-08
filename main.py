@@ -232,9 +232,16 @@ def music_edges(path: Path, deadline: float) -> tuple[float, float, float]:
                            if intervals[i][1] >= source_duration - 0.05), None)
     leading = intervals[leading_index][1] if leading_index is not None else 0.0
     trailing = intervals[trailing_index][0] if trailing_index is not None else source_duration
+    trimmed_indices = {leading_index, trailing_index}
+    if trailing_index is not None and trailing_index > 0 and trailing_index - 1 != leading_index:
+        prior_start, prior_end = intervals[trailing_index - 1]
+        # Trim an isolated blip in the final fade rather than looping the preceding gap.
+        if 0 <= trailing - prior_end <= 0.150 + 1e-6:
+            trailing = prior_start
+            trimmed_indices.add(trailing_index - 1)
     if leading >= trailing or trailing - leading < 0.1:
         raise MediaFailure()
-    if any(i not in {leading_index, trailing_index} for i in range(len(intervals))):
+    if any(i not in trimmed_indices for i in range(len(intervals))):
         raise MediaFailure("music_interior_silence")
     return leading, trailing, source_duration
 
