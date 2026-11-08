@@ -35,7 +35,7 @@ music_copies = NS["music_copies"]
 music_filter = NS["music_filter"]
 
 
-def write_tone(path, *, lead=0.0, tone=0.4, tail=0.0, gap=0.0, frequency=440):
+def write_tone(path, *, lead=0.0, tone=0.4, tail=0.0, gap=0.0, after_gap=None, frequency=440):
     rate = 44100
     with wave.open(str(path), "wb") as out:
         out.setnchannels(1)
@@ -47,7 +47,7 @@ def write_tone(path, *, lead=0.0, tone=0.4, tail=0.0, gap=0.0, frequency=440):
             for i in range(round(tone * rate)):
                 frames.extend(struct.pack("<h", int(12000 * math.sin(2 * math.pi * frequency * i / rate))))
             frames.extend(b"\0\0" * round(gap * rate))
-            for i in range(round(tone * rate)):
+            for i in range(round((tone if after_gap is None else after_gap) * rate)):
                 frames.extend(struct.pack("<h", int(12000 * math.sin(2 * math.pi * frequency * i / rate))))
         else:
             for i in range(round(tone * rate)):
@@ -113,6 +113,21 @@ class MusicContinuityTests(unittest.TestCase):
                     music_edges(path, time.monotonic() + 15)
                 expected_stage = "music_interior_silence" if path == gap else None
                 self.assertEqual(failure.exception.stage, expected_stage)
+
+    def test_short_active_tail_is_trimmed_without_allowing_interior_gaps(self):
+        for island in (0.117, 0.149, 0.151):
+            with self.subTest(island=island):
+                path = self.root / "tail.wav"
+                write_tone(path, lead=0.2, tone=2.0, gap=0.136, after_gap=island, tail=0.78)
+                if island > 0.15:
+                    with self.assertRaises(MediaFailure) as failure:
+                        music_edges(path, time.monotonic() + 15)
+                    self.assertEqual(failure.exception.stage, "music_interior_silence")
+                else:
+                    start, end, duration = music_edges(path, time.monotonic() + 15)
+                    self.assertAlmostEqual(start, 0.2, delta=0.001)
+                    self.assertAlmostEqual(end, 2.2, delta=0.001)
+                    self.assertAlmostEqual(duration, 3.116 + island, delta=0.001)
 
     def test_repeat_count_is_bounded_and_single_long_clip_needs_no_crossfade(self):
         self.assertIn("acrossfade", music_filter(0.0, 2.0, 5.0))
